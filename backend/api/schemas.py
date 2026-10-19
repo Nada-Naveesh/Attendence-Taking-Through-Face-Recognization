@@ -34,6 +34,7 @@ class StudentResponse(StudentBase):
     """Student response payload."""
     id: int
     has_embedding: bool = False
+    samples_processed: int = 1
     created_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)

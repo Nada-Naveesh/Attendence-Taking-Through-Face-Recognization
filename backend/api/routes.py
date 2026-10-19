@@ -129,15 +129,16 @@ def create_student(
 async def register_student_with_face(
     name: str = Form(..., description="Student full name"),
     roll_no: str = Form(..., description="Unique student matriculation/roll number"),
-    file: UploadFile = File(..., description="Biometric portrait image (uploaded or webcam captured)"),
+    files: List[UploadFile] = File(..., description="One or more biometric portrait images for multi-sample enrollment"),
     db: Session = Depends(get_db),
     baseline_service: BaselineHaarService = Depends(get_baseline_service)
 ):
     """
-    Biometric student registration with facial verification.
-    Accepts reference portrait via file upload or camera snapshot.
-    Validates face presence, saves reference photo to data/known_faces,
-    extracts facial feature embedding, and persists the student record.
+    Biometric student registration with multi-sample facial verification.
+    Accepts 1 or more portrait samples (uploaded or captured via webcam).
+    Validates face presence, extracts features for all valid samples,
+    computes an averaged, normalized biometric centroid vector for high accuracy,
+    persists all reference images to data/known_faces/<roll_no>/, and saves the student record.
     """
     clean_name = name.strip()
     clean_roll = roll_no.strip()
@@ -155,38 +156,58 @@ async def register_student_with_face(
             detail=f"Student with roll number '{clean_roll}' already exists."
         )
 
-    contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-    if image is None:
+    if not files:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid image format. Could not decode."
+            detail="At least one portrait image must be provided."
         )
 
-    # Detect face presence
-    boxes = baseline_service.detect_faces(image)
-    if not boxes:
+    # Prepare student reference directory
+    student_img_dir = settings.KNOWN_FACES_PATH / clean_roll
+    student_img_dir.mkdir(parents=True, exist_ok=True)
+
+    extracted_features = []
+    saved_samples_count = 0
+
+    for idx, file_item in enumerate(files):
+        contents = await file_item.read()
+        if not contents:
+            continue
+        nparr = np.frombuffer(contents, np.uint8)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if image is None:
+            continue
+
+        # Detect face
+        boxes = baseline_service.detect_faces(image)
+        if not boxes:
+            continue
+
+        # Sort by bounding box area (largest face)
+        boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+        face_chip = baseline_service.extract_face(image, boxes[0])
+        feature_vec = baseline_service.extract_spatial_lbp_histogram(face_chip)
+        extracted_features.append(feature_vec)
+
+        # Save sample image
+        sample_path = student_img_dir / f"sample_{saved_samples_count + 1}.jpg"
+        cv2.imwrite(str(sample_path), image)
+        saved_samples_count += 1
+
+    if not extracted_features:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="No face detected in portrait. Ensure adequate lighting and look directly at camera."
+            detail="No valid face detected across the provided image sample(s). Ensure proper lighting and face the camera directly."
         )
 
-    # Pick largest detected face
-    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
-    face_chip = baseline_service.extract_face(image, boxes[0])
-    feature_vec = baseline_service.extract_spatial_lbp_histogram(face_chip)
+    # Compute high-accuracy normalized centroid embedding: mean(features) / norm(mean)
+    centroid_vector = np.mean(extracted_features, axis=0)
+    norm = np.linalg.norm(centroid_vector)
+    if norm > 0:
+        centroid_vector = centroid_vector / norm
 
-    # Persist reference photo
-    settings.KNOWN_FACES_PATH.mkdir(parents=True, exist_ok=True)
-    save_filename = f"{clean_roll}.jpg"
-    save_path = settings.KNOWN_FACES_PATH / save_filename
-    cv2.imwrite(str(save_path), image)
-
-    # Persist student in database
     student = Student(name=clean_name, roll_no=clean_roll)
-    student.set_embedding(feature_vec)
+    student.set_embedding(centroid_vector)
     db.add(student)
     db.commit()
     db.refresh(student)
@@ -196,6 +217,7 @@ async def register_student_with_face(
         name=student.name,
         roll_no=student.roll_no,
         has_embedding=True,
+        samples_processed=saved_samples_count,
         created_at=student.created_at
     )
 

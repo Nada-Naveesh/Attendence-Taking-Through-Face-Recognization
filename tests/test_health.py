@@ -125,8 +125,8 @@ def test_register_student_validation():
     response = client.post(
         "/api/v1/register",
         data={"name": "Nikola Tesla", "roll_no": "EE-1888-001"},
-        files={"file": ("portrait.jpg", blank_bytes, "image/jpeg")}
+        files=[("files", ("portrait.jpg", blank_bytes, "image/jpeg"))]
     )
     # Expect 422 Unprocessable Entity because no face was detected in blank image
     assert response.status_code == 422
-    assert "No face detected" in response.json()["detail"]
+    assert "No valid face detected" in response.json()["detail"]
