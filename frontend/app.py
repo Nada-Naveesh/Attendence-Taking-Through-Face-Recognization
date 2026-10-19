@@ -90,30 +90,74 @@ with tabs[0]:
 # Tab 2: Register Student
 with tabs[1]:
     st.header("Enroll New Student")
-    with st.form("register_form"):
-        col_a, col_b = st.columns(2)
-        with col_a:
-            name = st.text_input("Full Name", placeholder="e.g. Marie Curie")
-            roll_no = st.text_input("Roll / Matriculation Number", placeholder="e.g. CS-2024-042")
-        with col_b:
-            uploaded_photo = st.file_uploader("Upload Biometric Reference Portrait", type=["jpg", "jpeg", "png"])
+    st.markdown("Register student metadata and biometric reference face portrait via webcam snapshot or file upload.")
 
-        submitted = st.form_submit_button("Enroll Student")
-        if submitted:
-            if not name or not roll_no:
-                st.warning("Please provide student name and roll number.")
-            else:
+    col_meta1, col_meta2 = st.columns(2)
+    with col_meta1:
+        reg_name = st.text_input("Full Name *", placeholder="e.g. Marie Curie", key="reg_name_input")
+    with col_meta2:
+        reg_roll = st.text_input("Roll / Matriculation Number *", placeholder="e.g. CS-2024-042", key="reg_roll_input")
+
+    st.markdown("---")
+    st.subheader("Biometric Reference Portrait")
+
+    capture_mode = st.radio(
+        "Choose Portrait Acquisition Method:",
+        ["📷 Capture via Webcam", "📁 Upload Image File"],
+        horizontal=True,
+        key="reg_capture_mode"
+    )
+
+    image_bytes = None
+    image_filename = "reference_portrait.jpg"
+
+    if capture_mode == "📷 Capture via Webcam":
+        st.caption("Look directly at the camera with clear lighting and click **Take Photo**.")
+        camera_img = st.camera_input("Webcam Biometric Capture", key="reg_webcam_input")
+        if camera_img is not None:
+            image_bytes = camera_img.getvalue()
+            image_filename = "webcam_portrait.jpg"
+            st.success("Webcam snapshot captured successfully!")
+    else:
+        st.caption("Upload a high-resolution frontal portrait (JPG, JPEG, or PNG).")
+        uploaded_img = st.file_uploader(
+            "Upload Portrait File",
+            type=["jpg", "jpeg", "png"],
+            key="reg_file_uploader"
+        )
+        if uploaded_img is not None:
+            image_bytes = uploaded_img.getvalue()
+            image_filename = uploaded_img.name
+            st.image(uploaded_img, caption="Selected Portrait Preview", width=240)
+
+    st.markdown("---")
+    if st.button("Enroll Student", type="primary", use_container_width=True):
+        clean_name = reg_name.strip()
+        clean_roll = reg_roll.strip()
+
+        if not clean_name or not clean_roll:
+            st.warning("Please provide both Full Name and Roll Number.")
+        elif image_bytes is None:
+            st.warning("Please capture a photo using your webcam or upload an image file.")
+        else:
+            with st.spinner("Analyzing biometric face quality and saving profile..."):
                 try:
-                    payload = {"name": name, "roll_no": roll_no}
-                    res = requests.post(f"{BACKEND_URL}/students", json=payload)
+                    files = {"file": (image_filename, image_bytes, "image/jpeg")}
+                    data = {"name": clean_name, "roll_no": clean_roll}
+                    res = requests.post(f"{BACKEND_URL}/register", data=data, files=files, timeout=10)
+
                     if res.status_code == 201:
-                        st.success(f"Student '{name}' registered successfully!")
+                        st.success(f"Student **{clean_name}** ({clean_roll}) registered successfully with facial embedding!")
+                        st.balloons()
                     elif res.status_code == 409:
-                        st.error(f"Student with roll number '{roll_no}' already exists.")
+                        st.error(f"Student with Roll Number **'{clean_roll}'** already exists in the system.")
+                    elif res.status_code == 422:
+                        detail = res.json().get("detail", "Face detection failed.")
+                        st.error(f"Biometric Quality Warning: {detail}")
                     else:
-                        st.error(f"Registration failed: {res.text}")
+                        st.error(f"Registration failed ({res.status_code}): {res.text}")
                 except Exception as err:
-                    st.error(f"Backend connection error: {err}")
+                    st.error(f"Failed to communicate with backend: {err}")
 
 # Tab 3: Group Photo Attendance
 with tabs[2]:

@@ -125,6 +125,81 @@ def create_student(
     )
 
 
+@router.post("/register", response_model=StudentResponse, status_code=status.HTTP_201_CREATED, tags=["Students"])
+async def register_student_with_face(
+    name: str = Form(..., description="Student full name"),
+    roll_no: str = Form(..., description="Unique student matriculation/roll number"),
+    file: UploadFile = File(..., description="Biometric portrait image (uploaded or webcam captured)"),
+    db: Session = Depends(get_db),
+    baseline_service: BaselineHaarService = Depends(get_baseline_service)
+):
+    """
+    Biometric student registration with facial verification.
+    Accepts reference portrait via file upload or camera snapshot.
+    Validates face presence, saves reference photo to data/known_faces,
+    extracts facial feature embedding, and persists the student record.
+    """
+    clean_name = name.strip()
+    clean_roll = roll_no.strip()
+
+    if not clean_name or not clean_roll:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Student name and roll number cannot be empty."
+        )
+
+    existing = db.query(Student).filter(Student.roll_no == clean_roll).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Student with roll number '{clean_roll}' already exists."
+        )
+
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if image is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image format. Could not decode."
+        )
+
+    # Detect face presence
+    boxes = baseline_service.detect_faces(image)
+    if not boxes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No face detected in portrait. Ensure adequate lighting and look directly at camera."
+        )
+
+    # Pick largest detected face
+    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+    face_chip = baseline_service.extract_face(image, boxes[0])
+    feature_vec = baseline_service.extract_spatial_lbp_histogram(face_chip)
+
+    # Persist reference photo
+    settings.KNOWN_FACES_PATH.mkdir(parents=True, exist_ok=True)
+    save_filename = f"{clean_roll}.jpg"
+    save_path = settings.KNOWN_FACES_PATH / save_filename
+    cv2.imwrite(str(save_path), image)
+
+    # Persist student in database
+    student = Student(name=clean_name, roll_no=clean_roll)
+    student.set_embedding(feature_vec)
+    db.add(student)
+    db.commit()
+    db.refresh(student)
+
+    return StudentResponse(
+        id=student.id,
+        name=student.name,
+        roll_no=student.roll_no,
+        has_embedding=True,
+        created_at=student.created_at
+    )
+
+
 # ------------------------------------------------------------------------------
 # Attendance Records Endpoints
 # ------------------------------------------------------------------------------

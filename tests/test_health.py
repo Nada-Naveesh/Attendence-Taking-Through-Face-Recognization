@@ -110,3 +110,23 @@ def test_attendance_logging_api():
     list_att = client.get("/api/v1/attendance")
     assert list_att.status_code == 200
     assert len(list_att.json()) == 1
+
+
+def test_register_student_validation():
+    """Verify biometric portrait registration validates face quality and rejects blank images."""
+    import cv2
+    import numpy as np
+
+    # Generate a blank image with no faces
+    blank_img = np.zeros((200, 200, 3), dtype=np.uint8)
+    _, buffer = cv2.imencode(".jpg", blank_img)
+    blank_bytes = buffer.tobytes()
+
+    response = client.post(
+        "/api/v1/register",
+        data={"name": "Nikola Tesla", "roll_no": "EE-1888-001"},
+        files={"file": ("portrait.jpg", blank_bytes, "image/jpeg")}
+    )
+    # Expect 422 Unprocessable Entity because no face was detected in blank image
+    assert response.status_code == 422
+    assert "No face detected" in response.json()["detail"]
