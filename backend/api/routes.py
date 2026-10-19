@@ -24,10 +24,12 @@ from backend.api.schemas import (
 )
 from backend.services.attendance import AttendanceService
 from backend.services.baseline_haar import BaselineHaarService
+from backend.services.face_recognition import DeepFaceService
 
 router = APIRouter()
 START_TIME = time.time()
 _baseline_service: Optional[BaselineHaarService] = None
+_deep_service: Optional[DeepFaceService] = None
 
 
 def get_baseline_service() -> BaselineHaarService:
@@ -36,6 +38,14 @@ def get_baseline_service() -> BaselineHaarService:
     if _baseline_service is None:
         _baseline_service = BaselineHaarService()
     return _baseline_service
+
+
+def get_deep_service() -> DeepFaceService:
+    """Lazy loader for Deep Learning (YuNet + SFace) service."""
+    global _deep_service
+    if _deep_service is None:
+        _deep_service = DeepFaceService()
+    return _deep_service
 
 
 @router.get("/health", response_model=HealthResponse, tags=["System"])
@@ -131,14 +141,13 @@ async def register_student_with_face(
     roll_no: str = Form(..., description="Unique student matriculation/roll number"),
     files: List[UploadFile] = File(..., description="One or more biometric portrait images for multi-sample enrollment"),
     db: Session = Depends(get_db),
-    baseline_service: BaselineHaarService = Depends(get_baseline_service)
+    deep_service: DeepFaceService = Depends(get_deep_service)
 ):
     """
-    Biometric student registration with multi-sample facial verification.
-    Accepts 1 or more portrait samples (uploaded or captured via webcam).
-    Validates face presence, extracts features for all valid samples,
-    computes an averaged, normalized biometric centroid vector for high accuracy,
-    persists all reference images to data/known_faces/<roll_no>/, and saves the student record.
+    Biometric student registration with multi-sample facial verification using Deep Learning.
+    Accepts 1 or more portrait samples (captured via auto webcam or file upload).
+    Detects faces with YuNet CNN, extracts 128-D aligned deep metric embeddings via SFace,
+    computes an averaged centroid vector for high accuracy, persists photos, and saves student record.
     """
     clean_name = name.strip()
     clean_roll = roll_no.strip()
@@ -178,15 +187,16 @@ async def register_student_with_face(
         if image is None:
             continue
 
-        # Detect face
-        boxes = baseline_service.detect_faces(image)
-        if not boxes:
+        # Detect face with DeepFaceService (YuNet)
+        faces = deep_service.detect_faces(image)
+        if not faces:
             continue
 
         # Sort by bounding box area (largest face)
-        boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
-        face_chip = baseline_service.extract_face(image, boxes[0])
-        feature_vec = baseline_service.extract_spatial_lbp_histogram(face_chip)
+        faces = sorted(faces, key=lambda f: f["box"][2] * f["box"][3], reverse=True)
+        feature_vec = deep_service.extract_embedding(image, faces[0])
+        if feature_vec is None:
+            continue
         extracted_features.append(feature_vec)
 
         # Save sample image
@@ -319,13 +329,12 @@ async def recognize_face(
     file: UploadFile = File(..., description="Camera frame image for biometric identification"),
     mark_attendance: bool = Query(True, description="Automatically mark attendance if recognized"),
     db: Session = Depends(get_db),
-    baseline_service: BaselineHaarService = Depends(get_baseline_service)
+    deep_service: DeepFaceService = Depends(get_deep_service)
 ):
     """
-    1:N Biometric facial identification and automatic attendance registration.
-    Extracts face features from probe frame, calculates cosine similarity against
-    all enrolled student centroid embeddings in database, and commits attendance
-    to SQLite AND the daily Attendance CSV log.
+    1:N Biometric facial identification and automatic attendance registration using Deep Learning.
+    Extracts deep metric embeddings via YuNet + SFace CNN, calculates cosine similarity against
+    enrolled student centroid vectors, and commits attendance to SQLite AND the daily Attendance CSV log.
     """
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
@@ -337,8 +346,8 @@ async def recognize_face(
             detail="Invalid image format. Could not decode."
         )
 
-    boxes = baseline_service.detect_faces(image)
-    if not boxes:
+    faces = deep_service.detect_faces(image)
+    if not faces:
         return RecognitionResult(
             matched=False,
             student_name="No Face Detected",
@@ -347,10 +356,16 @@ async def recognize_face(
         )
 
     # Pick largest detected face
-    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
-    best_box = boxes[0]
-    face_chip = baseline_service.extract_face(image, best_box)
-    probe_vec = baseline_service.extract_spatial_lbp_histogram(face_chip)
+    faces = sorted(faces, key=lambda f: f["box"][2] * f["box"][3], reverse=True)
+    best_face = faces[0]
+    probe_vec = deep_service.extract_embedding(image, best_face)
+    if probe_vec is None:
+        return RecognitionResult(
+            matched=False,
+            student_name="No Face Detected",
+            confidence=0.0,
+            box=best_face["box"]
+        )
 
     # Query registered students
     students = db.query(Student).filter(Student.embedding.isnot(None)).all()
@@ -359,7 +374,7 @@ async def recognize_face(
             matched=False,
             student_name="No Students Registered",
             confidence=0.0,
-            box=list(best_box)
+            box=best_face["box"]
         )
 
     best_student = None
@@ -370,18 +385,13 @@ async def recognize_face(
         if gallery_vec is None:
             continue
 
-        # Cosine similarity between unit normalized vectors
-        dot = float(np.dot(probe_vec, gallery_vec))
-        norm_p = float(np.linalg.norm(probe_vec))
-        norm_g = float(np.linalg.norm(gallery_vec))
-        sim = dot / (norm_p * norm_g) if norm_p > 0 and norm_g > 0 else 0.0
-
+        sim = deep_service.match_embeddings(probe_vec, gallery_vec)
         if sim > best_score:
             best_score = sim
             best_student = s
 
-    # Configurable verification threshold (0.55 for LBP spatial histograms)
-    threshold = 0.55
+    # Cosine match threshold: 0.60 for positive identification
+    threshold = 0.60
     if best_student and best_score >= threshold:
         if mark_attendance:
             AttendanceService.mark_attendance(
@@ -398,14 +408,14 @@ async def recognize_face(
             roll_no=best_student.roll_no,
             confidence=round(best_score, 4),
             liveness_passed=True,
-            box=list(best_box)
+            box=best_face["box"]
         )
 
     return RecognitionResult(
         matched=False,
         student_name="Unknown",
         confidence=round(best_score, 4),
-        box=list(best_box)
+        box=best_face["box"]
     )
 
 
