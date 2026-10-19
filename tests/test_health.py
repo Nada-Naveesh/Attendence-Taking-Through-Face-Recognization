@@ -130,3 +130,30 @@ def test_register_student_validation():
     # Expect 422 Unprocessable Entity because no face was detected in blank image
     assert response.status_code == 422
     assert "No valid face detected" in response.json()["detail"]
+
+
+def test_recognize_api_blank():
+    """Verify recognize endpoint returns matched=False when image has no face."""
+    import cv2
+    import numpy as np
+
+    blank_img = np.zeros((200, 200, 3), dtype=np.uint8)
+    _, buffer = cv2.imencode(".jpg", blank_img)
+    blank_bytes = buffer.tobytes()
+
+    response = client.post(
+        "/api/v1/recognize",
+        files={"file": ("frame.jpg", blank_bytes, "image/jpeg")}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["matched"] is False
+    assert data["student_name"] == "No Face Detected"
+
+
+def test_attendance_csv_endpoint():
+    """Verify attendance CSV download endpoint returns 200 and text/csv."""
+    response = client.get("/api/v1/attendance/csv")
+    assert response.status_code == 200
+    assert "text/csv" in response.headers.get("content-type", "")
+    assert "Record_ID,Student_ID" in response.text

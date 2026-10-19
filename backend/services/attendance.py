@@ -60,6 +60,34 @@ class AttendanceService:
         db.add(record)
         db.commit()
         db.refresh(record)
+
+        # Write/Append to Attendance CSV file
+        try:
+            import csv
+            from pathlib import Path
+            csv_dir = Path("Attendance")
+            csv_dir.mkdir(parents=True, exist_ok=True)
+            csv_file = csv_dir / f"Attendance_{today.strftime('%Y-%m-%d')}.csv"
+            
+            file_exists = csv_file.exists()
+            with open(csv_file, mode="a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["Record_ID", "Student_ID", "Roll_No", "Name", "Date", "Time", "Confidence", "Liveness_Passed"])
+                now = datetime.now()
+                writer.writerow([
+                    record.id,
+                    student.id,
+                    student.roll_no,
+                    student.name,
+                    now.strftime("%Y-%m-%d"),
+                    now.strftime("%H:%M:%S"),
+                    round(float(confidence), 4),
+                    bool(liveness_passed)
+                ])
+        except Exception as csv_err:
+            print(f"[WARNING] Failed to write attendance to CSV: {csv_err}")
+
         return record
 
     @staticmethod

@@ -308,3 +308,124 @@ async def baseline_detect_faces(
         "faces_detected": len(boxes),
         "bounding_boxes": [{"x": b[0], "y": b[1], "w": b[2], "h": b[3]} for b in boxes]
     }
+
+
+# ------------------------------------------------------------------------------
+# Biometric Facial Recognition & Attendance Verification
+# ------------------------------------------------------------------------------
+
+@router.post("/recognize", response_model=RecognitionResult, tags=["Biometrics"])
+async def recognize_face(
+    file: UploadFile = File(..., description="Camera frame image for biometric identification"),
+    mark_attendance: bool = Query(True, description="Automatically mark attendance if recognized"),
+    db: Session = Depends(get_db),
+    baseline_service: BaselineHaarService = Depends(get_baseline_service)
+):
+    """
+    1:N Biometric facial identification and automatic attendance registration.
+    Extracts face features from probe frame, calculates cosine similarity against
+    all enrolled student centroid embeddings in database, and commits attendance
+    to SQLite AND the daily Attendance CSV log.
+    """
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if image is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image format. Could not decode."
+        )
+
+    boxes = baseline_service.detect_faces(image)
+    if not boxes:
+        return RecognitionResult(
+            matched=False,
+            student_name="No Face Detected",
+            confidence=0.0,
+            box=None
+        )
+
+    # Pick largest detected face
+    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+    best_box = boxes[0]
+    face_chip = baseline_service.extract_face(image, best_box)
+    probe_vec = baseline_service.extract_spatial_lbp_histogram(face_chip)
+
+    # Query registered students
+    students = db.query(Student).filter(Student.embedding.isnot(None)).all()
+    if not students:
+        return RecognitionResult(
+            matched=False,
+            student_name="No Students Registered",
+            confidence=0.0,
+            box=list(best_box)
+        )
+
+    best_student = None
+    best_score = 0.0
+
+    for s in students:
+        gallery_vec = s.get_embedding()
+        if gallery_vec is None:
+            continue
+
+        # Cosine similarity between unit normalized vectors
+        dot = float(np.dot(probe_vec, gallery_vec))
+        norm_p = float(np.linalg.norm(probe_vec))
+        norm_g = float(np.linalg.norm(gallery_vec))
+        sim = dot / (norm_p * norm_g) if norm_p > 0 and norm_g > 0 else 0.0
+
+        if sim > best_score:
+            best_score = sim
+            best_student = s
+
+    # Configurable verification threshold (0.55 for LBP spatial histograms)
+    threshold = 0.55
+    if best_student and best_score >= threshold:
+        if mark_attendance:
+            AttendanceService.mark_attendance(
+                db=db,
+                student_id=best_student.id,
+                confidence=best_score,
+                liveness_passed=True,
+                allow_duplicate_same_day=False
+            )
+        return RecognitionResult(
+            matched=True,
+            student_id=best_student.id,
+            student_name=best_student.name,
+            roll_no=best_student.roll_no,
+            confidence=round(best_score, 4),
+            liveness_passed=True,
+            box=list(best_box)
+        )
+
+    return RecognitionResult(
+        matched=False,
+        student_name="Unknown",
+        confidence=round(best_score, 4),
+        box=list(best_box)
+    )
+
+
+@router.get("/attendance/csv", tags=["Attendance"])
+def download_today_attendance_csv():
+    """Download today's attendance CSV log file."""
+    from fastapi.responses import FileResponse
+    from datetime import date
+    from pathlib import Path
+
+    today_str = date.today().strftime("%Y-%m-%d")
+    csv_path = Path("Attendance") / f"Attendance_{today_str}.csv"
+
+    if not csv_path.exists():
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("Record_ID,Student_ID,Roll_No,Name,Date,Time,Confidence,Liveness_Passed\n")
+
+    return FileResponse(
+        path=str(csv_path),
+        filename=f"Attendance_{today_str}.csv",
+        media_type="text/csv"
+    )
