@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment Variables
+.env
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+data/attendance.db
+
+# Large Model Weights (gitignored per spec)
+models/*.pt
+models/*.onnx
+models/*.weights
+models/*.h5
+models/*.bin
+models/*.safetensors
+!models/.gitkeep
+
+# Data Directories
+data/known_faces/*
+!data/known_faces/.gitkeep
+data/test_set/*
+!data/test_set/.gitkeep
+
+# Legacy temporary folder
+old_repo_temp/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
