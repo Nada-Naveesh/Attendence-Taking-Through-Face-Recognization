@@ -74,9 +74,17 @@ except Exception:
 if not backend_online:
     st.warning(
         "⚠️ **FastAPI Backend Server is not running on port 8000!**\n\n"
-        "Please start the backend server in a separate terminal using:\n\n"
+        "Click the button below to start it automatically, or run it via terminal:\n\n"
         "` .venv\\Scripts\\uvicorn.exe backend.main:app --host 127.0.0.1 --port 8000 --reload `"
     )
+    if st.button("🚀 Start Backend Server Now", type="primary"):
+        import subprocess
+        python_exe = Path(".venv/Scripts/python.exe")
+        if python_exe.exists():
+            subprocess.Popen([str(python_exe), "-m", "uvicorn", "backend.main:app", "--host", "127.0.0.1", "--port", "8000", "--reload"])
+            st.info("Starting backend server... Reconnecting in 3 seconds.")
+            time.sleep(3)
+            st.rerun()
 
 # Main Navigation Tabs
 tabs = st.tabs([
