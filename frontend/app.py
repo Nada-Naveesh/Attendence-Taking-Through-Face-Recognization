@@ -153,9 +153,13 @@ with tabs[0]:
 
                         if box and len(box) == 4:
                             x, y, w, h = box
-                            if matched:
-                                color = (0, 255, 0)  # Green for recognized
-                                label = f"{rec_data.get('student_name')} ({conf*100:.1f}%)"
+                            liveness_ok = rec_data.get("liveness_passed", True)
+                            if matched and liveness_ok:
+                                color = (0, 255, 0)  # Green for recognized & live
+                                label = f"{rec_data.get('student_name')} ({conf*100:.1f}%) [LIVE]"
+                            elif not liveness_ok:
+                                color = (0, 140, 255)  # Orange for spoof rejection
+                                label = f"SPOOF REJECTED ({conf*100:.1f}%)"
                             else:
                                 color = (0, 0, 255)  # Red for unknown
                                 label = f"Unknown ({conf*100:.1f}%)"
@@ -163,7 +167,7 @@ with tabs[0]:
                             cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
                             cv2.putText(frame, label, (x, max(20, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
 
-                        if matched:
+                        if matched and rec_data.get("liveness_passed", True):
                             matched_student = rec_data.get("student_name")
                             matched_roll = rec_data.get("roll_no")
                             matched_conf = conf
@@ -356,30 +360,213 @@ with tabs[1]:
 # TAB 3: Classroom Group Photo Attendance
 # ==============================================================================
 with tabs[2]:
-    st.header("👥 Classroom Group Photo Recognition")
-    st.markdown("Upload a high-resolution classroom group photo to simultaneously detect and mark attendance for all recognized students.")
-    group_file = st.file_uploader("Upload Classroom Image", type=["jpg", "jpeg", "png"], key="group_uploader")
+    st.header("👥 Classroom Group Photo Attendance")
+    st.markdown(
+        "Upload a wide-angle classroom photo. The system will detect all student faces simultaneously, "
+        "extract 128-D SFace metric embeddings, execute 1-to-1 maximum margin matching, and mark attendance "
+        "for every recognized enrolled student in a single pass."
+    )
+
+    group_file = st.file_uploader(
+        "Upload Classroom Image (JPEG/PNG)",
+        type=["jpg", "jpeg", "png"],
+        key="group_uploader"
+    )
+
     if group_file:
-        st.image(group_file, caption="Uploaded Classroom Image", use_column_width=True)
-        if st.button("Process Group Attendance"):
-            st.info("Classroom group recognition pipeline processes multiple faces simultaneously via YOLOv8 face detection.")
+        col_img, col_info = st.columns([3, 2])
+        file_bytes = group_file.getvalue()
+        nparr = np.frombuffer(file_bytes, np.uint8)
+        raw_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        with col_img:
+            st.image(cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB), caption="Original Classroom Photo", use_column_width=True)
+
+        with col_info:
+            st.markdown("### Process Biometric Attendance")
+            st.caption("Runs YuNet face detector + SFace recognizer across all individuals present.")
+            auto_mark = st.checkbox("Automatically mark attendance for recognized students", value=True)
+            process_btn = st.button("🚀 Process Classroom Attendance", type="primary", use_container_width=True)
+
+        if process_btn:
+            with st.spinner("Analyzing classroom photo and identifying students..."):
+                try:
+                    res = requests.post(
+                        f"{BACKEND_URL}/recognize-group?mark_attendance={'true' if auto_mark else 'false'}",
+                        files={"file": (group_file.name, file_bytes, group_file.type)},
+                        timeout=30
+                    )
+                    if res.status_code == 200:
+                        group_data = res.json()
+                        total_faces = group_data.get("total_faces_detected", 0)
+                        recognized_count = group_data.get("recognized_count", 0)
+                        results = group_data.get("results", [])
+
+                        # Draw bounding boxes and names on the original image
+                        annotated = raw_bgr.copy()
+                        table_rows = []
+
+                        for r in results:
+                            box = r.get("box")
+                            matched = r.get("matched", False)
+                            s_name = r.get("student_name", "Unknown")
+                            roll = r.get("roll_no", "-")
+                            conf = r.get("confidence", 0.0)
+
+                            if box and len(box) == 4:
+                                x, y, w, h = box
+                                if matched:
+                                    color = (0, 255, 0)
+                                    label = f"{s_name} ({conf*100:.1f}%)"
+                                    table_rows.append({
+                                        "Status": "✅ Verified Present",
+                                        "Student Name": s_name,
+                                        "Roll Number": roll,
+                                        "Match Confidence": f"{conf*100:.1f}%"
+                                    })
+                                else:
+                                    color = (0, 0, 255)
+                                    label = f"Unknown ({conf*100:.1f}%)"
+
+                                cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 3)
+                                cv2.putText(
+                                    annotated,
+                                    label,
+                                    (x, max(25, y - 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.8,
+                                    color,
+                                    2
+                                )
+
+                        st.markdown("---")
+                        st.subheader("🎯 Identification & Attendance Results")
+                        m_col1, m_col2, m_col3 = st.columns(3)
+                        m_col1.metric("Total Faces Detected", total_faces)
+                        m_col2.metric("Enrolled Students Verified", recognized_count)
+                        m_col3.metric("Attendance Committed", recognized_count if auto_mark else 0)
+
+                        st.image(
+                            cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                            caption=f"Annotated Classroom ({recognized_count}/{total_faces} Identified)",
+                            use_column_width=True
+                        )
+
+                        if table_rows:
+                            st.markdown("#### Present Students Identified:")
+                            st.dataframe(pd.DataFrame(table_rows), use_container_width=True)
+                            st.success(f"Successfully recorded attendance for {recognized_count} students in today's log!")
+                        else:
+                            st.warning("No enrolled students were recognized in this image above the confidence threshold.")
+                    else:
+                        st.error(f"Recognition error ({res.status_code}): {res.text}")
+                except Exception as err:
+                    st.error(f"Failed to process classroom image: {err}")
 
 
 # ==============================================================================
 # TAB 4: Attendance Analytics & Risk Forecasting
 # ==============================================================================
 with tabs[3]:
-    st.header("📊 Attendance Analytics & Risk Forecasting")
-    st.markdown("Automated attendance trend visualization and student engagement modeling.")
+    st.header("📊 Longitudinal Attendance Analytics & Predictive Risk Modeling")
+    st.markdown(
+        "Educational Data Mining (EDM) dashboard providing real-time engagement monitoring "
+        "and early-warning risk scoring to prevent student academic debarment (< 75% attendance)."
+    )
+
+    # 1. Fetch risk report and attendance records
+    risk_data = []
+    attendance_records = []
     try:
-        att_res = requests.get(f"{BACKEND_URL}/attendance", timeout=3)
-        if att_res.status_code == 200:
-            records = att_res.json()
-            st.metric("Total Attendance Logs Recorded", len(records))
-            if records:
-                df_all = pd.DataFrame(records)
-                st.dataframe(df_all, use_container_width=True)
-        else:
-            st.warning("Unable to fetch attendance records from backend.")
-    except Exception as e:
-        st.warning(f"Backend not reachable: {e}")
+        r_resp = requests.get(f"{BACKEND_URL}/analytics/risk-report", timeout=5)
+        if r_resp.status_code == 200:
+            risk_data = r_resp.json()
+    except Exception:
+        pass
+
+    try:
+        a_resp = requests.get(f"{BACKEND_URL}/attendance?limit=1000", timeout=5)
+        if a_resp.status_code == 200:
+            attendance_records = a_resp.json()
+    except Exception:
+        pass
+
+    # 2. Key Metrics Row
+    total_students = len(risk_data)
+    total_logs = len(attendance_records)
+    avg_attendance = (
+        np.mean([item["attendance_rate"] for item in risk_data])
+        if risk_data else 100.0
+    )
+    at_risk_count = sum(1 for item in risk_data if item.get("risk_level") in ["Critical", "Moderate"])
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Enrolled Cohort", f"{total_students} Students")
+    c2.metric("Total Attendance Logs", f"{total_logs} Events")
+    c3.metric("Cohort Avg Attendance", f"{avg_attendance:.1f}%")
+    c4.metric(
+        "At-Risk Students (<75%)",
+        f"{at_risk_count} Alerts",
+        delta=f"-{at_risk_count}" if at_risk_count > 0 else "0",
+        delta_color="inverse"
+    )
+
+    st.markdown("---")
+
+    # 3. Attendance Trend Chart
+    if attendance_records:
+        st.subheader("📈 Longitudinal Attendance Trend")
+        df_att_all = pd.DataFrame(attendance_records)
+        if "timestamp" in df_att_all.columns:
+            df_att_all["date"] = pd.to_datetime(df_att_all["timestamp"]).dt.date
+            daily_counts = df_att_all.groupby("date").size().reset_index(name="Check-ins")
+            daily_counts["date"] = daily_counts["date"].astype(str)
+            st.bar_chart(data=daily_counts, x="date", y="Check-ins", use_container_width=True)
+
+    # 4. Cohort Risk Distribution & Early Warning Table
+    st.subheader("🚨 Early-Warning Student Risk Forecast")
+    if risk_data:
+        df_risk = pd.DataFrame(risk_data)
+
+        # Distribution breakdown
+        crit_count = sum(1 for item in risk_data if item.get("risk_level") == "Critical")
+        mod_count = sum(1 for item in risk_data if item.get("risk_level") == "Moderate")
+        low_count = sum(1 for item in risk_data if item.get("risk_level") == "Low")
+
+        rc1, rc2, rc3 = st.columns(3)
+        rc1.error(f"🔴 **Critical Risk**: {crit_count} Students")
+        rc2.warning(f"🟡 **Moderate Risk**: {mod_count} Students")
+        rc3.success(f"🟢 **Good Standing**: {low_count} Students")
+
+        # Display formatted table
+        display_cols = [
+            "name", "roll_no", "total_sessions", "attended_sessions",
+            "attendance_rate", "consecutive_absences", "attendance_momentum",
+            "risk_probability", "risk_level", "recommended_action"
+        ]
+        rename_map = {
+            "name": "Student Name",
+            "roll_no": "Roll Number",
+            "total_sessions": "Total Sessions",
+            "attended_sessions": "Attended",
+            "attendance_rate": "Attendance %",
+            "consecutive_absences": "Consecutive Absences",
+            "attendance_momentum": "14-Day Momentum",
+            "risk_probability": "Attrition Risk",
+            "risk_level": "Risk Tier",
+            "recommended_action": "Intervention Action"
+        }
+        df_table = df_risk[display_cols].rename(columns=rename_map)
+        st.dataframe(df_table, use_container_width=True)
+
+        # Critical students advisory
+        critical_students = [item for item in risk_data if item.get("risk_level") == "Critical"]
+        if critical_students:
+            with st.expander("⚠️ View Urgent Academic Counseling Actions"):
+                for cs in critical_students:
+                    st.markdown(
+                        f"- **{cs['name']}** (`{cs['roll_no']}`): Attendance is at **{cs['attendance_rate']}%** "
+                        f"with **{cs['consecutive_absences']} consecutive absences**. Action: *{cs['recommended_action']}*"
+                    )
+    else:
+        st.info("No student data available yet. Enroll students and mark attendance to see predictive risk trends.")

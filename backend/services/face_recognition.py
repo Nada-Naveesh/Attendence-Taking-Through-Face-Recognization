@@ -148,3 +148,92 @@ class DeepFaceService:
         # Standard dot product of unit vectors
         dot = float(np.dot(feat1, feat2))
         return max(0.0, min(1.0, dot))
+
+    def match_group_faces(
+        self,
+        image: np.ndarray,
+        enrolled_students: List[Tuple[int, str, str, np.ndarray]],
+        similarity_threshold: float = 0.60
+    ) -> List[Dict[str, Any]]:
+        """
+        Detects all faces in a group image and matches them against enrolled students.
+        Applies greedy maximum-margin assignment to ensure 1-to-1 matching.
+
+        Args:
+            image: Full BGR classroom/group frame.
+            enrolled_students: List of tuples (student_id, student_name, roll_no, embedding_vector).
+            similarity_threshold: Minimum cosine similarity score for positive identification.
+
+        Returns:
+            List of recognition result dictionaries for each detected face.
+        """
+        faces = self.detect_faces(image)
+        if not faces:
+            return []
+
+        # If no enrolled students, return all detected faces as Unknown
+        if not enrolled_students:
+            return [{
+                "matched": False,
+                "student_id": None,
+                "student_name": "Unknown",
+                "roll_no": None,
+                "confidence": round(face["confidence"], 4),
+                "box": face["box"]
+            } for face in faces]
+
+        # Extract embeddings for all detected faces
+        extracted_probes = []
+        for face in faces:
+            embedding = self.extract_embedding(image, face)
+            extracted_probes.append((face, embedding))
+
+        # Compute pairwise similarity candidate matches: (similarity, face_idx, student_idx)
+        candidate_matches = []
+        for face_idx, (face, probe_vec) in enumerate(extracted_probes):
+            if probe_vec is None:
+                continue
+            for s_idx, (s_id, s_name, s_roll, s_emb) in enumerate(enrolled_students):
+                if s_emb is None:
+                    continue
+                sim = self.match_embeddings(probe_vec, s_emb)
+                if sim >= similarity_threshold:
+                    candidate_matches.append((sim, face_idx, s_idx))
+
+        # Sort candidate matches descending by similarity for greedy 1-to-1 matching
+        candidate_matches.sort(key=lambda x: x[0], reverse=True)
+
+        assigned_faces = set()
+        assigned_students = set()
+        face_matches = {}
+
+        for sim, f_idx, s_idx in candidate_matches:
+            if f_idx not in assigned_faces and s_idx not in assigned_students:
+                assigned_faces.add(f_idx)
+                assigned_students.add(s_idx)
+                s_id, s_name, s_roll, _ = enrolled_students[s_idx]
+                face_matches[f_idx] = {
+                    "matched": True,
+                    "student_id": s_id,
+                    "student_name": s_name,
+                    "roll_no": s_roll,
+                    "confidence": round(sim, 4),
+                    "box": extracted_probes[f_idx][0]["box"]
+                }
+
+        # Build final results for all detected faces (including unmatched)
+        final_results = []
+        for f_idx, (face, _) in enumerate(extracted_probes):
+            if f_idx in face_matches:
+                final_results.append(face_matches[f_idx])
+            else:
+                final_results.append({
+                    "matched": False,
+                    "student_id": None,
+                    "student_name": "Unknown",
+                    "roll_no": None,
+                    "confidence": round(face["confidence"], 4),
+                    "box": face["box"]
+                })
+
+        return final_results

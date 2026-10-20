@@ -79,3 +79,21 @@ class GroupRecognitionResponse(BaseModel):
     recognized_count: int
     results: List[RecognitionResult]
     processed_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class RiskReportItem(BaseModel):
+    """Longitudinal student engagement and dropout risk forecast."""
+    student_id: int
+    name: str
+    roll_no: str
+    total_sessions: int
+    attended_sessions: int
+    attendance_rate: float
+    recent_14d_rate: float
+    consecutive_absences: int
+    attendance_momentum: float
+    risk_probability: float
+    risk_level: str
+    recommended_action: str
+
+    model_config = ConfigDict(from_attributes=True)

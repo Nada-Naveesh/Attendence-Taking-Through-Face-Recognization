@@ -157,3 +157,54 @@ def test_attendance_csv_endpoint():
     assert response.status_code == 200
     assert "text/csv" in response.headers.get("content-type", "")
     assert "Record_ID,Student_ID" in response.text
+
+
+def test_group_recognition_api_blank():
+    """Verify group photo recognition endpoint handles images with no faces gracefully."""
+    import cv2
+    import numpy as np
+
+    blank_img = np.zeros((300, 400, 3), dtype=np.uint8)
+    _, buffer = cv2.imencode(".jpg", blank_img)
+    blank_bytes = buffer.tobytes()
+
+    response = client.post(
+        "/api/v1/recognize-group?mark_attendance=false",
+        files={"file": ("classroom.jpg", blank_bytes, "image/jpeg")}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_faces_detected"] == 0
+    assert data["recognized_count"] == 0
+    assert len(data["results"]) == 0
+
+
+def test_analytics_risk_report_api():
+    """Verify predictive risk report endpoint computes cohort analytics."""
+    # Enroll test student
+    client.post("/api/v1/students", json={"name": "Grace Hopper", "roll_no": "NAV-TEST-001"})
+
+    response = client.get("/api/v1/analytics/risk-report")
+    assert response.status_code == 200
+    report = response.json()
+    assert isinstance(report, list)
+    assert len(report) >= 1
+    item = report[0]
+    assert "attendance_rate" in item
+    assert "risk_probability" in item
+    assert "risk_level" in item
+    assert "recommended_action" in item
+
+
+def test_liveness_service_eval():
+    """Verify LivenessService calculates texture variance and flags flat patches."""
+    import numpy as np
+    from backend.services.liveness import LivenessService
+
+    liveness = LivenessService()
+    # A completely flat synthetic patch (variance = 0.0) should fail texture check
+    flat_patch = np.ones((100, 100, 3), dtype=np.uint8) * 128
+    face_info = {"box": [0, 0, 100, 100], "raw_face": None}
+    result = liveness.evaluate_liveness(flat_patch, face_info)
+    assert result["liveness_passed"] is False
+    assert result["texture_variance"] < 10.0

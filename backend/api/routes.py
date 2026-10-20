@@ -20,16 +20,21 @@ from backend.api.schemas import (
     StudentResponse,
     AttendanceCreate,
     AttendanceResponse,
-    RecognitionResult
+    RecognitionResult,
+    GroupRecognitionResponse,
+    RiskReportItem
 )
 from backend.services.attendance import AttendanceService
 from backend.services.baseline_haar import BaselineHaarService
 from backend.services.face_recognition import DeepFaceService
+from backend.services.liveness import LivenessService
+from backend.services.analytics import AttendanceAnalyticsService
 
 router = APIRouter()
 START_TIME = time.time()
 _baseline_service: Optional[BaselineHaarService] = None
 _deep_service: Optional[DeepFaceService] = None
+_liveness_service: Optional[LivenessService] = None
 
 
 def get_baseline_service() -> BaselineHaarService:
@@ -46,6 +51,14 @@ def get_deep_service() -> DeepFaceService:
     if _deep_service is None:
         _deep_service = DeepFaceService()
     return _deep_service
+
+
+def get_liveness_service() -> LivenessService:
+    """Lazy loader for Presentation Attack Detection (Liveness) service."""
+    global _liveness_service
+    if _liveness_service is None:
+        _liveness_service = LivenessService()
+    return _liveness_service
 
 
 @router.get("/health", response_model=HealthResponse, tags=["System"])
@@ -329,11 +342,13 @@ async def recognize_face(
     file: UploadFile = File(..., description="Camera frame image for biometric identification"),
     mark_attendance: bool = Query(True, description="Automatically mark attendance if recognized"),
     db: Session = Depends(get_db),
-    deep_service: DeepFaceService = Depends(get_deep_service)
+    deep_service: DeepFaceService = Depends(get_deep_service),
+    liveness_service: LivenessService = Depends(get_liveness_service)
 ):
     """
     1:N Biometric facial identification and automatic attendance registration using Deep Learning.
-    Extracts deep metric embeddings via YuNet + SFace CNN, calculates cosine similarity against
+    Extracts deep metric embeddings via YuNet + SFace CNN, validates multi-modal anti-spoofing
+    (Laplacian texture frequency variance + Eye Aspect Ratio), calculates cosine similarity against
     enrolled student centroid vectors, and commits attendance to SQLite AND the daily Attendance CSV log.
     """
     contents = await file.read()
@@ -358,6 +373,11 @@ async def recognize_face(
     # Pick largest detected face
     faces = sorted(faces, key=lambda f: f["box"][2] * f["box"][3], reverse=True)
     best_face = faces[0]
+
+    # Evaluate multi-modal presentation attack detection (liveness)
+    liveness_eval = liveness_service.evaluate_liveness(image, best_face)
+    liveness_passed = liveness_eval.get("liveness_passed", True)
+
     probe_vec = deep_service.extract_embedding(image, best_face)
     if probe_vec is None:
         return RecognitionResult(
@@ -393,6 +413,18 @@ async def recognize_face(
     # Cosine match threshold: 0.60 for positive identification
     threshold = 0.60
     if best_student and best_score >= threshold:
+        # Enforce presentation attack detection guard
+        if not liveness_passed:
+            return RecognitionResult(
+                matched=False,
+                student_id=best_student.id,
+                student_name=f"SPOOF REJECTED: {best_student.name}",
+                roll_no=best_student.roll_no,
+                confidence=round(best_score, 4),
+                liveness_passed=False,
+                box=best_face["box"]
+            )
+
         if mark_attendance:
             AttendanceService.mark_attendance(
                 db=db,
@@ -415,8 +447,98 @@ async def recognize_face(
         matched=False,
         student_name="Unknown",
         confidence=round(best_score, 4),
+        liveness_passed=liveness_passed,
         box=best_face["box"]
     )
+
+
+@router.post("/recognize-group", response_model=GroupRecognitionResponse, tags=["Biometrics"])
+async def recognize_group_faces(
+    file: UploadFile = File(..., description="High-resolution classroom group photo"),
+    mark_attendance: bool = Query(True, description="Automatically mark attendance for recognized students"),
+    db: Session = Depends(get_db),
+    deep_service: DeepFaceService = Depends(get_deep_service)
+):
+    """
+    Multi-face simultaneous classroom group photo recognition.
+    Detects all students in a single wide-angle classroom shot using YuNet CNN,
+    extracts 128-D SFace embeddings, performs greedy 1-to-1 maximum margin matching,
+    and automatically registers attendance for all matched enrolled students.
+    """
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if image is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image format. Could not decode."
+        )
+
+    # Gather registered gallery embeddings
+    students = db.query(Student).filter(Student.embedding.isnot(None)).all()
+    gallery_tuples = []
+    for s in students:
+        emb = s.get_embedding()
+        if emb is not None:
+            gallery_tuples.append((s.id, s.name, s.roll_no, emb))
+
+    # Match all faces in the classroom photo
+    match_results = deep_service.match_group_faces(image, gallery_tuples, similarity_threshold=0.60)
+
+    recognized_count = 0
+    recognition_payloads = []
+
+    for item in match_results:
+        is_matched = item["matched"]
+        s_id = item.get("student_id")
+        conf = item.get("confidence", 0.0)
+
+        if is_matched and s_id is not None:
+            recognized_count += 1
+            if mark_attendance:
+                try:
+                    AttendanceService.mark_attendance(
+                        db=db,
+                        student_id=s_id,
+                        confidence=conf,
+                        liveness_passed=True,
+                        allow_duplicate_same_day=False
+                    )
+                except Exception:
+                    pass
+
+        recognition_payloads.append(
+            RecognitionResult(
+                matched=is_matched,
+                student_id=s_id,
+                student_name=item.get("student_name"),
+                roll_no=item.get("roll_no"),
+                confidence=conf,
+                liveness_passed=True,
+                box=item.get("box")
+            )
+        )
+
+    return GroupRecognitionResponse(
+        total_faces_detected=len(match_results),
+        recognized_count=recognized_count,
+        results=recognition_payloads
+    )
+
+
+# ------------------------------------------------------------------------------
+# Predictive Educational Analytics Endpoints
+# ------------------------------------------------------------------------------
+
+@router.get("/analytics/risk-report", response_model=List[RiskReportItem], tags=["Analytics"])
+def get_cohort_risk_report(db: Session = Depends(get_db)):
+    """
+    Generates a longitudinal educational attrition risk forecast across all enrolled students.
+    Identifies students at risk of academic debarment / disqualification (< 75% attendance)
+    using educational data mining (EDM) behavioral indicators (attendance rate, consecutive absences, momentum).
+    """
+    return AttendanceAnalyticsService.get_cohort_risk_report(db)
 
 
 @router.get("/attendance/csv", tags=["Attendance"])
